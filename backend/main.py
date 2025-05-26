@@ -24,7 +24,7 @@ import httpx
 
 # Tesseract path
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
-POPPLER_PATH = r"C:\poppler\poppler-24.08.0\Library\bin"
+POPPLER_PATH = None
 
 app = FastAPI()
 
