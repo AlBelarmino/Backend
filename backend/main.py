@@ -23,7 +23,7 @@ from dotenv import load_dotenv
 import httpx
 
 # Tesseract path
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 POPPLER_PATH = r"C:\poppler\poppler-24.08.0\Library\bin"
 
 app = FastAPI()
