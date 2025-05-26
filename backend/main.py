@@ -31,7 +31,7 @@ app = FastAPI()
 # CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["http://localhost:3000", "https://your-vercel-app.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,10 +39,11 @@ app.add_middleware(
 
 # MySQL configuration
 db_config = {
-    "host": "localhost",
+    "host": "turntable.proxy.rlwy.net",
     "user": "root",
-    "password": "",
+    "password": "lNKLKFIqVIFvAmiJkDJYpKHyFAagyyhJ",
     "database": "payslip",
+    "port": 19999
 }
 
 load_dotenv()
@@ -1284,25 +1285,25 @@ async def get_available_months(username: str):
         connection = mysql.connector.connect(**db_config)
         cursor = connection.cursor(dictionary=True)
 
-        # Get user ID
         cursor.execute("SELECT id FROM users WHERE username = %s", (username,))
         user = cursor.fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
-        # Get distinct month+year pairs
         cursor.execute("""
-            SELECT DISTINCT TRIM(month) as month, year
-            FROM payslips 
-            WHERE user_id = %s
-            ORDER BY year DESC, 
-                     STR_TO_DATE(CONCAT('01 ', month), '%d %M') DESC
+            SELECT * FROM (
+                SELECT DISTINCT TRIM(month) as month, year
+                FROM payslips 
+                WHERE user_id = %s
+            ) AS months
+            ORDER BY year DESC, STR_TO_DATE(CONCAT('01 ', month), '%%d %%M') DESC
         """, (user['id'],))
         
         results = cursor.fetchall()
         return [{"month": row["month"], "year": row["year"]} for row in results]
 
     except Exception as e:
+        traceback.print_exc()  # <-- This will show the exact error in the console
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if 'connection' in locals() and connection.is_connected():
