@@ -1238,9 +1238,24 @@ async def get_payslip(username: str, month: str, year: int):
 
         # 🧾 Government deductions
         deductions = [
-            {"label": "GSIS", "amount": float(payslip.get("total_deductions", 0)) - float(payslip.get("loan_deduction", 0)) - float(payslip.get("tax_deduction", 0)) - float(payslip.get("philhealth_deduction", 0))},  # optional split
-            {"label": "PhilHealth", "amount": float(payslip.get("philhealth_deduction", 0))},
-            {"label": "Tax", "amount": float(payslip.get("tax_deduction", 0))},
+            {
+                "label": "GSIS",
+                "amount": float(payslip.get("total_deductions", 0)) 
+                        - float(payslip.get("loan_deduction", 0)) 
+                        - float(payslip.get("tax_deduction", 0)) 
+                        - float(payslip.get("philhealth_deduction", 0)),
+                "balance": 0.0
+            },
+            {
+                "label": "PhilHealth",
+                "amount": float(payslip.get("philhealth_deduction", 0)),
+                "balance": 0.0
+            },
+            {
+                "label": "Tax",
+                "amount": float(payslip.get("tax_deduction", 0)),
+                "balance": 0.0
+            },
         ] + loan_deductions
 
         response = {
