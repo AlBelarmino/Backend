@@ -31,7 +31,7 @@ app = FastAPI()
 # CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://frontend-nu-azure-26.vercel.app","frontend-git-main-albelarminos-projects.vercel.app"],  # Adjust as needed
+    allow_origins=["https://frontend-nu-azure-26.vercel.app","frontend-git-main-albelarminos-projects.vercel.app","https://autopayslip.netlify.app"],  # Adjust as needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
