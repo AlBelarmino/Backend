@@ -1464,11 +1464,13 @@ async def get_latest_payslip(username: str):
         
         user_id = user["id"]
 
-        # Get latest payslip
+        # Get latest payslip based on year/month instead of created_at
         cursor.execute("""
-            SELECT * FROM payslips
+            SELECT *
+            FROM payslips
             WHERE user_id = %s
-            ORDER BY created_at DESC
+            ORDER BY year DESC, 
+                     STR_TO_DATE(CONCAT('01 ', month), '%%d %%M') DESC
             LIMIT 1
         """, (user_id,))
         payslip = cursor.fetchone()
@@ -1478,25 +1480,30 @@ async def get_latest_payslip(username: str):
         payslip_id = payslip["id"]
 
         # Fetch adjustments if available
-        cursor.execute("SELECT total_deductions, net_income, late_deduction FROM payslip_adjustments WHERE payslip_id = %s", (payslip_id,))
+        cursor.execute("""
+            SELECT total_deductions, net_income, late_deduction
+            FROM payslip_adjustments
+            WHERE payslip_id = %s
+        """, (payslip_id,))
         adjustment = cursor.fetchone()
 
-        if adjustment:
-            net_income = float(adjustment["net_income"])
-            late_deduction = float(adjustment["late_deduction"])
-        else:
-            net_income = float(payslip["net_income"])
-            late_deduction = 0.0
+        net_income = float(adjustment["net_income"]) if adjustment else float(payslip["net_income"])
+        late_deduction = float(adjustment["late_deduction"]) if adjustment and adjustment["late_deduction"] else 0.0
 
         # Bonuses
         cursor.execute("SELECT bonus_name, amount FROM payslip_bonuses WHERE payslip_id = %s", (payslip_id,))
-        bonuses = [{"label": row["bonus_name"], "amount": float(row["amount"])} for row in cursor.fetchall()]
+        bonuses = [
+            {"label": row["bonus_name"], "amount": float(row["amount"])}
+            for row in cursor.fetchall()
+        ]
 
-        # Loans
+        # Loans and late deduction
         cursor.execute("SELECT loan_name, amount FROM payslip_loan_deductions WHERE payslip_id = %s", (payslip_id,))
-        loans = [{"label": row["loan_name"], "amount": float(row["amount"])} for row in cursor.fetchall()]
+        loans = [
+            {"label": row["loan_name"], "amount": float(row["amount"])}
+            for row in cursor.fetchall()
+        ]
 
-        # Add late deduction to the deduction list if applicable
         if late_deduction > 0:
             loans.append({
                 "label": "Late Deduction",
@@ -1507,7 +1514,7 @@ async def get_latest_payslip(username: str):
             "fullName": user["full_name"],
             "period": f"{payslip['month']} {payslip['year']}",
             "grossIncome": float(payslip["gross_income"]),
-            "netPay": net_income,  # ✅ Use adjusted if available
+            "netPay": net_income,
             "bonuses": bonuses,
             "deductions": loans
         }
