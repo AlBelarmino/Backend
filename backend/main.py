@@ -1707,10 +1707,9 @@ async def get_user_records(username: str = Query(...)):
         user = cursor.fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-
         user_id = user["id"]
 
-        # ✅ Use JOIN to include adjustments directly
+        # Get payslips + latest adjustments
         cursor.execute("""
             SELECT 
                 p.id AS payslip_id,
@@ -1718,47 +1717,50 @@ async def get_user_records(username: str = Query(...)):
                 p.year,
                 p.gross_income,
                 p.created_at,
-                -- original values
                 p.total_deductions AS original_deductions,
                 p.net_income AS original_net,
-                -- adjustment values (can be NULL)
                 adj.total_deductions AS adj_deductions,
                 adj.net_income AS adj_net
             FROM payslips p
-            LEFT JOIN payslip_adjustments adj ON adj.payslip_id = p.id
+            LEFT JOIN (
+                SELECT pa.*
+                FROM payslip_adjustments pa
+                INNER JOIN (
+                    SELECT payslip_id, MAX(updated_at) AS latest
+                    FROM payslip_adjustments
+                    GROUP BY payslip_id
+                ) latest_adj 
+                ON pa.payslip_id = latest_adj.payslip_id 
+                AND pa.updated_at = latest_adj.latest
+            ) adj ON adj.payslip_id = p.id
             WHERE p.user_id = %s
             ORDER BY p.year DESC, 
                      STR_TO_DATE(CONCAT('01 ', p.month), '%%d %%M') DESC
         """, (user_id,))
         
-        records = []
-        for row in cursor.fetchall():
+        payslips = cursor.fetchall()
+        formatted = []
+
+        for row in payslips:
             try:
                 date_obj = datetime.strptime(f"{row['month']} {row['year']}", "%B %Y")
-
-                # ✅ Use adjusted values if available, fallback to original
-                total_deductions = float(row["adj_deductions"]) if row["adj_deductions"] is not None else float(row["original_deductions"])
-                net_income = float(row["adj_net"]) if row["adj_net"] is not None else float(row["original_net"])
-                gross_income = float(row["gross_income"])
-
-                records.append({
+                formatted.append({
                     "period": date_obj.strftime("%Y-%m"),
                     "displayMonth": date_obj.strftime("%B %Y"),
-                    "gross_income": gross_income,
-                    "total_deductions": total_deductions,
-                    "net_income": net_income,
-                    "created_at": row["created_at"].strftime("%Y-%m-%d") if row["created_at"] else None
+                    "gross_income": float(row["gross_income"]),
+                    "total_deductions": float(row["adj_deductions"] or row["original_deductions"]),
+                    "net_income": float(row["adj_net"] or row["original_net"]),
+                    "created_at": row["created_at"].strftime("%Y-%m-%d")
                 })
-
             except Exception as e:
-                print(f"⚠️ Skip malformed record: {e}")
+                print(f"⚠️ Skipping malformed record: {str(e)}")
                 continue
 
-        return records
+        return formatted
 
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
     finally:
         if 'cursor' in locals(): cursor.close()
