@@ -1435,6 +1435,13 @@ async def get_available_months(username: str):
             cursor.close()
             connection.close()
 
+def cleanup_cursor(cursor):
+    try:
+        while cursor.nextset():
+            pass
+    except:
+        pass
+
 @app.get("/payslip/latest")
 async def get_latest_payslip(username: str):
     try:
@@ -1444,6 +1451,7 @@ async def get_latest_payslip(username: str):
         # 1. Get the user
         cursor.execute("SELECT id, full_name FROM users WHERE username = %s", (username,))
         user = cursor.fetchone()
+        cleanup_cursor(cursor)
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         user_id = user["id"]
@@ -1457,6 +1465,7 @@ async def get_latest_payslip(username: str):
             LIMIT 1
         """, (user_id,))
         payslip = cursor.fetchone()
+        cleanup_cursor(cursor)
         if not payslip:
             raise HTTPException(status_code=404, detail="No payslip found")
         payslip_id = payslip["id"]
@@ -1468,16 +1477,21 @@ async def get_latest_payslip(username: str):
             WHERE payslip_id = %s
         """, (payslip_id,))
         adjustment = cursor.fetchone()
+        cleanup_cursor(cursor)
         net_income = float(adjustment["net_income"]) if adjustment and adjustment["net_income"] else float(payslip["net_income"])
         late_deduction = float(adjustment["late_deduction"]) if adjustment and adjustment["late_deduction"] else 0.0
 
         # 4. Bonuses
         cursor.execute("SELECT bonus_name, amount FROM payslip_bonuses WHERE payslip_id = %s", (payslip_id,))
-        bonuses = [{"label": row["bonus_name"], "amount": float(row["amount"])} for row in cursor.fetchall()]
+        bonus_rows = cursor.fetchall()
+        cleanup_cursor(cursor)
+        bonuses = [{"label": row["bonus_name"], "amount": float(row["amount"])} for row in bonus_rows]
 
         # 5. Loans
         cursor.execute("SELECT loan_name, amount FROM payslip_loan_deductions WHERE payslip_id = %s", (payslip_id,))
-        loans = [{"label": row["loan_name"], "amount": float(row["amount"])} for row in cursor.fetchall()]
+        loan_rows = cursor.fetchall()
+        cleanup_cursor(cursor)
+        loans = [{"label": row["loan_name"], "amount": float(row["amount"])} for row in loan_rows]
 
         # Append late deduction if any
         if late_deduction > 0:
