@@ -1719,15 +1719,20 @@ async def get_user_records(username: str = Query(...)):
                      STR_TO_DATE(CONCAT('01 ', p.month), '%%d %%M') DESC
         """, (user_id,))
         
-        payslips = cursor.fetchall()
+        payslips = cursor.fetchall()  # ✅ Fully consume the result set
         formatted = []
 
         for row in payslips:
             payslip_id = row["payslip_id"]
 
-            # Check for adjustments
-            cursor.execute("SELECT total_deductions, net_income FROM payslip_adjustments WHERE payslip_id = %s", (payslip_id,))
-            adjustment = cursor.fetchone()
+            # ✅ Use a new cursor or ensure result is consumed before next query
+            adj_cursor = connection.cursor(dictionary=True)
+            adj_cursor.execute(
+                "SELECT total_deductions, net_income FROM payslip_adjustments WHERE payslip_id = %s",
+                (payslip_id,)
+            )
+            adjustment = adj_cursor.fetchone()
+            adj_cursor.close()  # ✅ Always close extra cursors
 
             total_deductions = float(adjustment["total_deductions"]) if adjustment else float(row["original_deductions"])
             net_income = float(adjustment["net_income"]) if adjustment else float(row["original_net"])
@@ -1755,6 +1760,7 @@ async def get_user_records(username: str = Query(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        if connection.is_connected():
+        if 'cursor' in locals() and cursor:
             cursor.close()
+        if connection.is_connected():
             connection.close()
