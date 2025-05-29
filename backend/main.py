@@ -1441,61 +1441,47 @@ async def get_latest_payslip(username: str):
         connection = mysql.connector.connect(**db_config)
         cursor = connection.cursor(dictionary=True)
 
-        # Get user
+        # 1. Get the user
         cursor.execute("SELECT id, full_name FROM users WHERE username = %s", (username,))
         user = cursor.fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-
         user_id = user["id"]
 
-        # Get latest payslip
+        # 2. Get latest payslip
         cursor.execute("""
-            SELECT *
-            FROM payslips
+            SELECT * FROM payslips
             WHERE user_id = %s
-            ORDER BY year DESC, 
+            ORDER BY year DESC,
                      STR_TO_DATE(CONCAT('01 ', month), '%%d %%M') DESC
             LIMIT 1
         """, (user_id,))
         payslip = cursor.fetchone()
         if not payslip:
             raise HTTPException(status_code=404, detail="No payslip found")
-
         payslip_id = payslip["id"]
 
-        # Fetch adjustments
+        # 3. Fetch precomputed adjustments (net income and late)
         cursor.execute("""
-            SELECT total_deductions, net_income, late_deduction
+            SELECT net_income, late_deduction
             FROM payslip_adjustments
             WHERE payslip_id = %s
         """, (payslip_id,))
-        adjustment = cursor.fetchone()  # ✅ ensure this is fetched before the next query
-
-        net_income = float(adjustment["net_income"]) if adjustment else float(payslip["net_income"])
+        adjustment = cursor.fetchone()
+        net_income = float(adjustment["net_income"]) if adjustment and adjustment["net_income"] else float(payslip["net_income"])
         late_deduction = float(adjustment["late_deduction"]) if adjustment and adjustment["late_deduction"] else 0.0
 
-        # Bonuses
+        # 4. Bonuses
         cursor.execute("SELECT bonus_name, amount FROM payslip_bonuses WHERE payslip_id = %s", (payslip_id,))
-        bonus_rows = cursor.fetchall()  # ✅ ensure full fetch before moving on
-        bonuses = [
-            {"label": row["bonus_name"], "amount": float(row["amount"])}
-            for row in bonus_rows
-        ]
+        bonuses = [{"label": row["bonus_name"], "amount": float(row["amount"])} for row in cursor.fetchall()]
 
-        # Loans and late deduction
+        # 5. Loans
         cursor.execute("SELECT loan_name, amount FROM payslip_loan_deductions WHERE payslip_id = %s", (payslip_id,))
-        loan_rows = cursor.fetchall()  # ✅ ensure full fetch before moving on
-        loans = [
-            {"label": row["loan_name"], "amount": float(row["amount"])}
-            for row in loan_rows
-        ]
+        loans = [{"label": row["loan_name"], "amount": float(row["amount"])} for row in cursor.fetchall()]
 
+        # Append late deduction if any
         if late_deduction > 0:
-            loans.append({
-                "label": "Late Deduction",
-                "amount": late_deduction
-            })
+            loans.append({"label": "Late Deduction", "amount": late_deduction})
 
         return {
             "fullName": user["full_name"],
@@ -1507,14 +1493,12 @@ async def get_latest_payslip(username: str):
         }
 
     finally:
-        # ✅ Defensive check and close
-        try:
-            if 'cursor' in locals():
-                cursor.close()
-            if 'connection' in locals():
-                connection.close()
-        except:
-            pass  # optional: log if closing fails
+        if 'cursor' in locals():
+            try: cursor.close()
+            except: pass
+        if 'connection' in locals():
+            try: connection.close()
+            except: pass
 
 @app.post("/api/payslip/summary")
 async def get_payslip_summary(data: MonthSelection):
