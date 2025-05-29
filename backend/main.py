@@ -1251,7 +1251,7 @@ async def get_payslip(username: str, month: str, year: int):
         payslip_id = payslip["id"]
         print(f"📄 Found payslip ID: {payslip_id}")
 
-        # 👔 Get employee profile
+        # 💼 Get employee profile
         cursor.execute("""
             SELECT employment_type, base_salary_hour, base_monthly_salary, salary_grade
             FROM employee_profiles
@@ -1263,7 +1263,7 @@ async def get_payslip(username: str, month: str, year: int):
         rate_per_hour = float(profile.get("base_salary_hour", 0)) if employment_type == "irregular" else None
         rate_per_month = float(profile.get("base_monthly_salary", 0)) if employment_type == "regular" else None
 
-        # 🎁 Get bonuses
+        # 🏱 Get bonuses
         cursor.execute("""
             SELECT bonus_name, amount
             FROM payslip_bonuses
@@ -1274,34 +1274,22 @@ async def get_payslip(username: str, month: str, year: int):
         # ⏱ Late Deduction (computed from late_minutes only for regular)
         late_minutes = int(payslip.get("late_minutes", 0))
         late_deduction = 0.0
-        deductions = []  # ✅ fix the UnboundLocalError here
+        deductions = []  # ✅ Initialize early
 
-        # 🧾 Government deductions will be computed after late deduction
-        # But for regular, compute hourly rate from monthly
+        # 🧾 Compute hourly rate & late deduction for regular
         if employment_type.strip().lower() == "regular":
             monthly_salary = float(profile.get("base_monthly_salary", 0))
             working_days = int(payslip.get("working_days") or 22)
             hours_per_day = 8
             hourly_rate = round((monthly_salary / working_days) / hours_per_day, 2)
-            print(f"🧮 Computed hourly_rate from monthly: {hourly_rate}")
+            late_deduction = round((late_minutes / 60) * hourly_rate, 2)
+            print(f"💸 Computed late deduction: {late_deduction}")
 
-            # ⏱ Late deduction logic
-            late_minutes = int(payslip.get("late_minutes", 0))
-            late_deduction = 0.0
-
-            if employment_type.strip().lower() == "regular":
-                monthly_salary = float(profile.get("base_monthly_salary", 0))
-                working_days = int(payslip.get("working_days") or 22)
-                hours_per_day = 8
-                hourly_rate = round((monthly_salary / working_days) / hours_per_day, 2)
-                late_deduction = round((late_minutes / 60) * hourly_rate, 2)
-                print(f"💸 Computed late deduction: {late_deduction}")
-
-                deductions.append({
-                    "label": "Late Deduction",
-                    "amount": late_deduction,
-                    "balance": 0.0
-                })
+            deductions.append({
+                "label": "Late Deduction",
+                "amount": late_deduction,
+                "balance": 0.0
+            })
 
         # ✅ Adjust total deductions and net income for response
         existing_deductions = float(payslip.get("total_deductions", 0))
@@ -1309,6 +1297,7 @@ async def get_payslip(username: str, month: str, year: int):
 
         total_deductions = existing_deductions + late_deduction
         net_income = existing_net - late_deduction
+
         cursor.execute("""
             INSERT INTO payslip_adjustments (payslip_id, late_deduction, total_deductions, net_income)
             VALUES (%s, %s, %s, %s)
@@ -1318,15 +1307,12 @@ async def get_payslip(username: str, month: str, year: int):
                 net_income = VALUES(net_income),
                 updated_at = NOW()
         """, (payslip_id, late_deduction, total_deductions, net_income))
-
         connection.commit()
-        print("💾 Saved late deduction & adjustments to payslip_adjustments.")
+        print("📂 Saved late deduction & adjustments to payslip_adjustments.")
 
         # 💸 Get loan deductions
         cursor.execute("""
-            SELECT 
-                pl.loan_name, 
-                pl.amount,
+            SELECT pl.loan_name, pl.amount,
                 (SELECT balance FROM employee_loans 
                  WHERE user_id = %s AND loan_name = pl.loan_name
                  ORDER BY created_at DESC LIMIT 1) as balance
@@ -1342,32 +1328,35 @@ async def get_payslip(username: str, month: str, year: int):
                 "balance": float(l["balance"]) if l["balance"] is not None else 0.0
             })
 
-        # 🧾 Government + Late Deductions
-        gsis_amount = float(payslip.get("total_deductions", 0)) \
-                      - float(payslip.get("loan_deduction", 0)) \
-                      - float(payslip.get("tax_deduction", 0)) \
-                      - float(payslip.get("philhealth_deduction", 0)) \
-                      - late_deduction
+        # 💲 Fetch adjustment values for final GSIS calculation
+        cursor.execute("""
+            SELECT total_deductions, net_income, late_deduction
+            FROM payslip_adjustments
+            WHERE payslip_id = %s
+            LIMIT 1
+        """, (payslip_id,))
+        adjustment = cursor.fetchone()
+
+        if adjustment:
+            total_deductions = float(adjustment["total_deductions"])
+            net_income = float(adjustment["net_income"])
+            late_deduction = float(adjustment["late_deduction"])
+        else:
+            total_deductions = float(payslip.get("total_deductions", 0)) + late_deduction
+            net_income = float(payslip.get("net_income", 0)) - late_deduction
+
+        gsis_amount = total_deductions \
+            - float(payslip.get("loan_deduction", 0)) \
+            - float(payslip.get("tax_deduction", 0)) \
+            - float(payslip.get("philhealth_deduction", 0)) \
+            - late_deduction
 
         deductions = [
-            {
-                "label": "GSIS",
-                "amount": gsis_amount,
-                "balance": 0.0
-            },
-            {
-                "label": "PhilHealth",
-                "amount": float(payslip.get("philhealth_deduction", 0)),
-                "balance": 0.0
-            },
-            {
-                "label": "Tax",
-                "amount": float(payslip.get("tax_deduction", 0)),
-                "balance": 0.0
-            }
+            {"label": "GSIS", "amount": gsis_amount, "balance": 0.0},
+            {"label": "PhilHealth", "amount": float(payslip.get("philhealth_deduction", 0)), "balance": 0.0},
+            {"label": "Tax", "amount": float(payslip.get("tax_deduction", 0)), "balance": 0.0}
         ]
 
-        # Append late deduction only for regular employees
         if employment_type == "regular":
             deductions.append({
                 "label": "Late Deduction",
@@ -1375,10 +1364,8 @@ async def get_payslip(username: str, month: str, year: int):
                 "balance": 0.0
             })
 
-        # Add loan deductions
         deductions += loan_deductions
 
-        # 📤 Final structured response
         response = {
             "fullName": full_name,
             "period": parse_db_month_to_iso(normalized_month, normalized_year),
@@ -1390,7 +1377,7 @@ async def get_payslip(username: str, month: str, year: int):
             "grossIncome": float(payslip.get("gross_income", 0)),
             "bonuses": bonuses,
             "deductions": deductions,
-            "netPay": float(payslip.get("net_income", 0)),
+            "netPay": round(net_income, 2),
             "status": "processed",
             "workingDays": payslip.get("working_days", 0),
             "daysPresent": payslip.get("days_present", 0),
@@ -1398,11 +1385,10 @@ async def get_payslip(username: str, month: str, year: int):
             "leaveUsed": payslip.get("leave_used", 0),
             "lateMinutes": late_minutes,
             "lateDeduction": late_deduction,
-            "netPay": round(net_income, 2),  # ✅ updated net pay
-            "totalDeductions": round(total_deductions, 2)  # ✅ updated total
+            "totalDeductions": round(total_deductions, 2)
         }
 
-        print(f"📤 Final response: {response}")
+        print(f"📄 Final response: {response}")
         return response
 
     except mysql.connector.Error as err:
@@ -1417,7 +1403,6 @@ async def get_payslip(username: str, month: str, year: int):
             cursor.close()
         if 'connection' in locals():
             connection.close()
-
 
 @app.get("/available-months")
 async def get_available_months(username: str):
