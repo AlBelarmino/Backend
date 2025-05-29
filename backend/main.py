@@ -896,27 +896,66 @@ async def compute_salary(payload: SalaryRequest):
         except:
             working_days = 22  # Fallback value
 
-        # 4. Get daily entries and compute hours
+        # 4. Get daily entries and compute hours + late minutes
         cursor.execute("SELECT * FROM dtr_days WHERE dtr_id = %s", (dtr["id"],))
         day_entries = cursor.fetchall()
         
-        def compute_daily_hours(e):
+        total_hours = 0.0
+        total_late_minutes = 0
+        days_present = 0
+        
+        for entry in day_entries:
             try:
-                times = [
-                    datetime.strptime(e[period], "%H:%M") 
-                    for period in ['am_arrival', 'am_departure', 'pm_arrival', 'pm_departure']
-                    if e.get(period)
-                ]
-                if len(times) != 4:
-                    return 0.0
-                return (times[1] - times[0] + times[3] - times[2]).seconds / 3600
-            except:
-                return 0.0
+                # Initialize variables for this day
+                daily_hours = 0.0
+                daily_late_minutes = 0
+                
+                # AM Arrival Late Calculation
+                if entry["am_arrival"]:
+                    try:
+                        am_arrival = datetime.strptime(entry["am_arrival"], "%H:%M")
+                        expected_am = datetime.strptime("08:00", "%H:%M")
+                        if am_arrival > expected_am:
+                            late_minutes = (am_arrival - expected_am).seconds // 60
+                            daily_late_minutes += late_minutes
+                    except Exception as e:
+                        print(f"Error processing AM arrival: {str(e)}")
+                
+                # PM Arrival Late Calculation
+                if entry["pm_arrival"]:
+                    try:
+                        pm_arrival = datetime.strptime(entry["pm_arrival"], "%H:%M")
+                        expected_pm = datetime.strptime("13:00", "%H:%M")
+                        if pm_arrival > expected_pm:
+                            late_minutes = (pm_arrival - expected_pm).seconds // 60
+                            daily_late_minutes += late_minutes
+                    except Exception as e:
+                        print(f"Error processing PM arrival: {str(e)}")
+                
+                # Calculate working hours
+                try:
+                    times = []
+                    for period in ['am_arrival', 'am_departure', 'pm_arrival', 'pm_departure']:
+                        if entry.get(period):
+                            times.append(datetime.strptime(entry[period], "%H:%M"))
+                    
+                    if len(times) == 4:
+                        am_hours = (times[1] - times[0]).seconds / 3600
+                        pm_hours = (times[3] - times[2]).seconds / 3600
+                        daily_hours = am_hours + pm_hours
+                        days_present += 1
+                except Exception as e:
+                    print(f"Error calculating hours: {str(e)}")
+                
+                # Add to totals
+                total_hours += daily_hours
+                total_late_minutes += daily_late_minutes
+                
+            except Exception as e:
+                print(f"Error processing day entry: {str(e)}")
+                continue
 
-        total_hours = sum(compute_daily_hours(e) for e in day_entries)
-        days_present = sum(1 for e in day_entries if e.get("am_arrival") and e.get("pm_arrival"))
-
-        # 5. Get payroll profile with proper error handling
+        # 5. Get payroll profile
         cursor.execute("""
             SELECT base_salary_hour, employment_type, leave_credits,
                    gsis_deduction, philhealth_deduction, tax_deduction,
@@ -927,18 +966,28 @@ async def compute_salary(payload: SalaryRequest):
         if not profile:
             raise HTTPException(status_code=404, detail="Payroll profile not found")
 
-                # Convert all values to float with error handling
+        # Convert all values to float with error handling
         try:
-                    rate = float(profile["base_salary_hour"])
-                    monthly_salary = float(profile["base_monthly_salary"])
-                    employment_type = profile["employment_type"]
-                    leave_credits = float(profile["leave_credits"] or 0)
-                    philhealth = float(profile["philhealth_deduction"] or 0)
-                    tax = float(profile["tax_deduction"] or 0)
-                    gsis = float(profile["gsis_deduction"] or 0)
+            rate = float(profile["base_salary_hour"])
+            monthly_salary = float(profile["base_monthly_salary"])
+            employment_type = profile["employment_type"]
+            leave_credits = float(profile["leave_credits"] or 0)
+            philhealth = float(profile["philhealth_deduction"] or 0)
+            tax = float(profile["tax_deduction"] or 0)
+            gsis = float(profile["gsis_deduction"] or 0)
         except (TypeError, ValueError) as e:
             raise HTTPException(status_code=500, detail=f"Invalid payroll values: {str(e)}")
 
+        # Calculate late deduction (only for regular employees)
+        late_deduction = 0.0
+        if employment_type == "regular":
+            # Convert late minutes to hours
+            late_hours = total_late_minutes / 60
+            # Calculate deduction based on hourly rate
+            late_deduction = round(late_hours * rate, 2)
+            print(f"⏱ Late deduction calculated: {late_deduction} (from {total_late_minutes} minutes)")
+
+        # 6. Calculate gross income based on employment type
         if employment_type == "irregular":
             gross = total_hours * rate
             days_absent = 0
@@ -949,24 +998,25 @@ async def compute_salary(payload: SalaryRequest):
             leave_used = min(leave_credits, days_absent)
             unpaid_absent_days = max(days_absent - leave_used, 0)
             absent_deduction = round((monthly_salary / working_days) * unpaid_absent_days, 2)
-            gross = monthly_salary - absent_deduction
+            gross = monthly_salary - absent_deduction - late_deduction  # Deduct late penalty
             new_leave_credits = leave_credits - leave_used
+            
+            # Update leave credits in profile
             cursor.execute(
                 "UPDATE employee_profiles SET leave_credits = %s WHERE user_id = %s",
                 (new_leave_credits, user_id)
             )
+            print(f"📝 Updated leave credits: {new_leave_credits}")
 
-        # 7. Process Loans - NOW AT CORRECT INDENTATION LEVEL
+        # 7. Process Loans
         loan_deduction = 0.0
         loans_to_save = []
-
         try:
-            print("\n🔎 Checking loans for deduction...")
             cursor.execute("""
                 SELECT id, loan_name, amount, duration_months, 
                     start_month, start_year, balance
                 FROM employee_loans 
-                WHERE user_id = %s AND balance >= 0
+                WHERE user_id = %s AND balance > 0
             """, (user_id,))
             loans = cursor.fetchall()
             
@@ -974,7 +1024,7 @@ async def compute_salary(payload: SalaryRequest):
             
             for loan in loans:
                 try:
-                    # Handle month format (both "01" and "January")
+                    # Handle month format
                     if loan['start_month'].isdigit():
                         month_num = int(loan['start_month'])
                         start_month = calendar.month_name[month_num]
@@ -1001,70 +1051,71 @@ async def compute_salary(payload: SalaryRequest):
                             "UPDATE employee_loans SET balance = %s WHERE id = %s",
                             (new_balance, loan['id'])
                         )
+                        print(f"📝 Updated loan balance: {loan['loan_name']} = {new_balance}")
                 except Exception as e:
                     print(f"Error processing loan {loan.get('id')}: {str(e)}")
                     continue
-
         except Exception as e:
             print(f"Loan processing failed: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Loan processing error: {str(e)}")
-                    
-        # 8. Process Bonuses - Updated to match your schema
+
+        # 8. Process Bonuses
         bonuses = 0.0
         bonuses_to_save = []
-
-        cursor.execute("""
-            SELECT amount, frequency, bonus_type, bonus_name 
-            FROM employee_bonuses 
-            WHERE user_id = %s
-        """, (user_id,))
-        
-        bonuses_data = cursor.fetchall()
-        for b in bonuses_data:
-            try:
-                # Monthly bonuses always apply
-                if b["frequency"] == "monthly":
-                    bonuses += float(b["amount"])
-                    bonuses_to_save.append({
-                        'bonus_name': b["bonus_name"],  # Using bonus_name instead of bonus_type
-                        'amount': float(b["amount"])
-                    })
-                # Yearly bonuses only in December
-                elif b["frequency"] == "yearly" and dtr_month.lower() == "december":
-                    bonuses += float(b["amount"])
-                    bonuses_to_save.append({
-                        'bonus_name': b["bonus_name"],  # Using bonus_name instead of bonus_type
-                        'amount': float(b["amount"])
-                    })
-            except Exception as e:
-                print(f"⚠️ Error processing bonus: {str(e)}")
-                continue
-
+        try:
+            cursor.execute("""
+                SELECT amount, frequency, bonus_name 
+                FROM employee_bonuses 
+                WHERE user_id = %s
+            """, (user_id,))
+            
+            bonuses_data = cursor.fetchall()
+            for b in bonuses_data:
+                try:
+                    # Monthly bonuses always apply
+                    if b["frequency"] == "monthly":
+                        bonuses += float(b["amount"])
+                        bonuses_to_save.append({
+                            'bonus_name': b["bonus_name"],
+                            'amount': float(b["amount"])
+                        })
+                    # Yearly bonuses only in December
+                    elif b["frequency"] == "yearly" and dtr_month.lower() == "december":
+                        bonuses += float(b["amount"])
+                        bonuses_to_save.append({
+                            'bonus_name': b["bonus_name"],
+                            'amount': float(b["amount"])
+                        })
+                except Exception as e:
+                    print(f"Error processing bonus: {str(e)}")
+                    continue
+        except Exception as e:
+            print(f"Bonus processing failed: {str(e)}")
 
         # 9. Final calculations
-        total_deductions = round(gsis + philhealth + tax + loan_deduction, 2)
+        total_deductions = round(gsis + philhealth + tax + loan_deduction + late_deduction, 2)
         net = round(gross + bonuses - total_deductions, 2)
 
-        # 10. Save payslip
+        # 10. Save payslip with late information
         cursor.execute("""
             INSERT INTO payslips (
                 user_id, dtr_id, month, year,
                 working_days, days_present, days_absent, leave_used,
-                total_hours, gross_income, bonuses,
+                total_hours, late_minutes, late_deduction, gross_income, bonuses,
                 philhealth_deduction, tax_deduction, loan_deduction,
                 total_deductions, net_income, created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
         """, (
             user_id, dtr["id"], dtr_month, dtr_year,
             working_days, days_present, days_absent, leave_used,
-            round(total_hours, 2), round(gross, 2), round(bonuses, 2),
+            round(total_hours, 2), total_late_minutes, late_deduction, round(gross, 2), round(bonuses, 2),
             philhealth, tax, round(loan_deduction, 2),
             total_deductions, net
         ))
         
         payslip_id = cursor.lastrowid
+        print(f"💾 Saved payslip ID: {payslip_id}")
 
-        # 11. Save loan deductions to payslip_loan_deductions
+        # 11. Save loan deductions
         for loan in loans_to_save:
             cursor.execute("""
                 INSERT INTO payslip_loan_deductions 
@@ -1072,7 +1123,7 @@ async def compute_salary(payload: SalaryRequest):
                 VALUES (%s, %s, %s)
             """, (payslip_id, loan['loan_name'], loan['amount']))
 
-        # 12. Save bonuses to payslip_bonuses
+        # 12. Save bonuses
         for bonus in bonuses_to_save:
             cursor.execute("""
                 INSERT INTO payslip_bonuses 
@@ -1080,7 +1131,7 @@ async def compute_salary(payload: SalaryRequest):
                 VALUES (%s, %s, %s)
             """, (payslip_id, bonus['bonus_name'], bonus['amount']))
 
-        # 11. Update DTR status
+        # 13. Update DTR status
         cursor.execute("""
             UPDATE dtrs SET status = 'processed', processed_at = NOW()
             WHERE id = %s
@@ -1094,10 +1145,13 @@ async def compute_salary(payload: SalaryRequest):
                 "employee": dtr["employee_name"],
                 "period": f"{dtr_month} {dtr_year}",
                 "grossIncome": round(gross, 2),
+                "lateMinutes": total_late_minutes, 
+                "lateDeduction": late_deduction,
                 "deductions": {
                     "philhealth": philhealth,
                     "tax": tax,
                     "loans": round(loan_deduction, 2),
+                    "late": round(late_deduction, 2),
                     "total": total_deductions
                 },
                 "netPay": net
@@ -1107,14 +1161,15 @@ async def compute_salary(payload: SalaryRequest):
     except HTTPException:
         raise
     except Exception as e:
-        connection.rollback()
-        print(f"Error: {str(e)}")
+        if 'connection' in locals() and connection.is_connected():
+            connection.rollback()
+        print(f"❌ Error: {str(e)}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        if connection.is_connected():
+        if 'connection' in locals() and connection.is_connected():
             cursor.close()
             connection.close()
-
 
 #fetching payslips
 def format_month_for_db(month_str: str) -> tuple:
@@ -1169,14 +1224,14 @@ async def get_payslip(username: str, month: str, year: int):
 
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        
+
         user_id = user["id"]
         full_name = user["full_name"]
         print(f"✅ Found user ID: {user_id}, Name: {full_name}")
 
         # 📅 Normalize month format
         parsed_month, parsed_year = format_month_for_db(month)
-        normalized_month = parsed_month.strip().lower().capitalize() if parsed_month else month.strip().lower().capitalize()
+        normalized_month = parsed_month.strip().capitalize() if parsed_month else month.strip().capitalize()
         normalized_year = parsed_year if parsed_year != 0 else year
         print(f"📅 Normalized month: {normalized_month}, year: {normalized_year}")
 
@@ -1192,7 +1247,7 @@ async def get_payslip(username: str, month: str, year: int):
         payslip = cursor.fetchone()
         if not payslip:
             raise HTTPException(status_code=404, detail=f"No payslip found for {normalized_month} {normalized_year}")
-        
+
         payslip_id = payslip["id"]
         print(f"📄 Found payslip ID: {payslip_id}")
 
@@ -1216,18 +1271,69 @@ async def get_payslip(username: str, month: str, year: int):
         """, (payslip_id,))
         bonuses = [{"label": b["bonus_name"], "amount": float(b["amount"])} for b in cursor.fetchall()]
 
+        # ⏱ Late Deduction (computed from late_minutes only for regular)
+        late_minutes = int(payslip.get("late_minutes", 0))
+        late_deduction = 0.0
+        deductions = []  # ✅ fix the UnboundLocalError here
+
+        # 🧾 Government deductions will be computed after late deduction
+        # But for regular, compute hourly rate from monthly
+        if employment_type.strip().lower() == "regular":
+            monthly_salary = float(profile.get("base_monthly_salary", 0))
+            working_days = int(payslip.get("working_days") or 22)
+            hours_per_day = 8
+            hourly_rate = round((monthly_salary / working_days) / hours_per_day, 2)
+            print(f"🧮 Computed hourly_rate from monthly: {hourly_rate}")
+
+            # ⏱ Late deduction logic
+            late_minutes = int(payslip.get("late_minutes", 0))
+            late_deduction = 0.0
+
+            if employment_type.strip().lower() == "regular":
+                monthly_salary = float(profile.get("base_monthly_salary", 0))
+                working_days = int(payslip.get("working_days") or 22)
+                hours_per_day = 8
+                hourly_rate = round((monthly_salary / working_days) / hours_per_day, 2)
+                late_deduction = round((late_minutes / 60) * hourly_rate, 2)
+                print(f"💸 Computed late deduction: {late_deduction}")
+
+                deductions.append({
+                    "label": "Late Deduction",
+                    "amount": late_deduction,
+                    "balance": 0.0
+                })
+
+        # ✅ Adjust total deductions and net income for response
+        existing_deductions = float(payslip.get("total_deductions", 0))
+        existing_net = float(payslip.get("net_income", 0))
+
+        total_deductions = existing_deductions + late_deduction
+        net_income = existing_net - late_deduction
+        cursor.execute("""
+            INSERT INTO payslip_adjustments (payslip_id, late_deduction, total_deductions, net_income)
+            VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                late_deduction = VALUES(late_deduction),
+                total_deductions = VALUES(total_deductions),
+                net_income = VALUES(net_income),
+                updated_at = NOW()
+        """, (payslip_id, late_deduction, total_deductions, net_income))
+
+        connection.commit()
+        print("💾 Saved late deduction & adjustments to payslip_adjustments.")
+
         # 💸 Get loan deductions
         cursor.execute("""
             SELECT 
                 pl.loan_name, 
                 pl.amount,
                 (SELECT balance FROM employee_loans 
-                WHERE user_id = %s AND loan_name = pl.loan_name
-                ORDER BY created_at DESC LIMIT 1) as balance
+                 WHERE user_id = %s AND loan_name = pl.loan_name
+                 ORDER BY created_at DESC LIMIT 1) as balance
             FROM payslip_loan_deductions pl
             WHERE pl.payslip_id = %s
         """, (user_id, payslip_id))
-        
+
         loan_deductions = []
         for l in cursor.fetchall():
             loan_deductions.append({
@@ -1236,14 +1342,17 @@ async def get_payslip(username: str, month: str, year: int):
                 "balance": float(l["balance"]) if l["balance"] is not None else 0.0
             })
 
-        # 🧾 Government deductions
+        # 🧾 Government + Late Deductions
+        gsis_amount = float(payslip.get("total_deductions", 0)) \
+                      - float(payslip.get("loan_deduction", 0)) \
+                      - float(payslip.get("tax_deduction", 0)) \
+                      - float(payslip.get("philhealth_deduction", 0)) \
+                      - late_deduction
+
         deductions = [
             {
                 "label": "GSIS",
-                "amount": float(payslip.get("total_deductions", 0)) 
-                        - float(payslip.get("loan_deduction", 0)) 
-                        - float(payslip.get("tax_deduction", 0)) 
-                        - float(payslip.get("philhealth_deduction", 0)),
+                "amount": gsis_amount,
                 "balance": 0.0
             },
             {
@@ -1255,9 +1364,21 @@ async def get_payslip(username: str, month: str, year: int):
                 "label": "Tax",
                 "amount": float(payslip.get("tax_deduction", 0)),
                 "balance": 0.0
-            },
-        ] + loan_deductions
+            }
+        ]
 
+        # Append late deduction only for regular employees
+        if employment_type == "regular":
+            deductions.append({
+                "label": "Late Deduction",
+                "amount": late_deduction,
+                "balance": 0.0
+            })
+
+        # Add loan deductions
+        deductions += loan_deductions
+
+        # 📤 Final structured response
         response = {
             "fullName": full_name,
             "period": parse_db_month_to_iso(normalized_month, normalized_year),
@@ -1275,6 +1396,10 @@ async def get_payslip(username: str, month: str, year: int):
             "daysPresent": payslip.get("days_present", 0),
             "daysAbsent": payslip.get("days_absent", 0),
             "leaveUsed": payslip.get("leave_used", 0),
+            "lateMinutes": late_minutes,
+            "lateDeduction": late_deduction,
+            "netPay": round(net_income, 2),  # ✅ updated net pay
+            "totalDeductions": round(total_deductions, 2)  # ✅ updated total
         }
 
         print(f"📤 Final response: {response}")
@@ -1331,15 +1456,15 @@ async def get_latest_payslip(username: str):
         connection = mysql.connector.connect(**db_config)
         cursor = connection.cursor(dictionary=True)
 
-        # Make sure to fetch both id and full_name
+        # Get user
         cursor.execute("SELECT id, full_name FROM users WHERE username = %s", (username,))
         user = cursor.fetchone()
-
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         
         user_id = user["id"]
 
+        # Get latest payslip
         cursor.execute("""
             SELECT * FROM payslips
             WHERE user_id = %s
@@ -1352,6 +1477,17 @@ async def get_latest_payslip(username: str):
 
         payslip_id = payslip["id"]
 
+        # Fetch adjustments if available
+        cursor.execute("SELECT total_deductions, net_income, late_deduction FROM payslip_adjustments WHERE payslip_id = %s", (payslip_id,))
+        adjustment = cursor.fetchone()
+
+        if adjustment:
+            net_income = float(adjustment["net_income"])
+            late_deduction = float(adjustment["late_deduction"])
+        else:
+            net_income = float(payslip["net_income"])
+            late_deduction = 0.0
+
         # Bonuses
         cursor.execute("SELECT bonus_name, amount FROM payslip_bonuses WHERE payslip_id = %s", (payslip_id,))
         bonuses = [{"label": row["bonus_name"], "amount": float(row["amount"])} for row in cursor.fetchall()]
@@ -1360,11 +1496,18 @@ async def get_latest_payslip(username: str):
         cursor.execute("SELECT loan_name, amount FROM payslip_loan_deductions WHERE payslip_id = %s", (payslip_id,))
         loans = [{"label": row["loan_name"], "amount": float(row["amount"])} for row in cursor.fetchall()]
 
+        # Add late deduction to the deduction list if applicable
+        if late_deduction > 0:
+            loans.append({
+                "label": "Late Deduction",
+                "amount": late_deduction
+            })
+
         return {
             "fullName": user["full_name"],
             "period": f"{payslip['month']} {payslip['year']}",
             "grossIncome": float(payslip["gross_income"]),
-            "netPay": float(payslip["net_income"]),
+            "netPay": net_income,  # ✅ Use adjusted if available
             "bonuses": bonuses,
             "deductions": loans
         }
@@ -1438,6 +1581,29 @@ async def get_payslip_summary(data: MonthSelection):
             gross = float(payslip.get("gross_income", 0))
             deductions = float(payslip.get("total_deductions", 0))
             net = float(payslip.get("net_income", 0))
+            
+            late_minutes = int(payslip.get("late_minutes", 0))
+            late_deduction = 0.0
+            if user.get("employment_type", "irregular").strip().lower() == "regular":
+                monthly_salary = float(user.get("base_monthly_salary", 0))
+                working_days = int(payslip.get("working_days") or 22)
+                hourly_rate = round((monthly_salary / working_days) / 8, 2)
+                late_deduction = round((late_minutes / 60) * hourly_rate, 2)
+
+            deductions += late_deduction
+            net -= late_deduction
+            monthly_summary[month_key] = {
+                "gross_income": gross,
+                "total_deductions": deductions,
+                "net_income": net,
+                "quarter": quarter_key
+            }
+            quarter_totals[f"{quarter_key}_gross"] += gross
+            quarter_totals[f"{quarter_key}_deductions"] += deductions
+            quarter_totals[f"{quarter_key}_net"] += net
+
+            if late_deduction > 0:
+                deduction_breakdown["Late Deduction"][month_key] += late_deduction
 
             monthly_summary[month_key] = {
                 "gross_income": gross,
@@ -1540,11 +1706,12 @@ async def get_user_records(username: str = Query(...)):
         # Get payslip records
         cursor.execute("""
             SELECT 
+                p.id AS payslip_id,
                 p.month, 
                 p.year,
                 p.gross_income,
-                p.total_deductions,
-                p.net_income,
+                p.total_deductions AS original_deductions,
+                p.net_income AS original_net,
                 p.created_at
             FROM payslips p
             WHERE p.user_id = %s
@@ -1553,18 +1720,28 @@ async def get_user_records(username: str = Query(...)):
         """, (user_id,))
         
         payslips = cursor.fetchall()
-
-        # Format data
         formatted = []
+
         for row in payslips:
+            payslip_id = row["payslip_id"]
+
+            # Check for adjustments
+            cursor.execute("SELECT total_deductions, net_income FROM payslip_adjustments WHERE payslip_id = %s", (payslip_id,))
+            adjustment = cursor.fetchone()
+
+            total_deductions = float(adjustment["total_deductions"]) if adjustment else float(row["original_deductions"])
+            net_income = float(adjustment["net_income"]) if adjustment else float(row["original_net"])
+            gross_income = float(row["gross_income"])
+
+            # Format period
             try:
                 date_obj = datetime.strptime(f"{row['month']} {row['year']}", "%B %Y")
                 formatted.append({
                     "period": date_obj.strftime("%Y-%m"),
                     "displayMonth": date_obj.strftime("%B %Y"),
-                    "gross_income": float(row["gross_income"]),
-                    "total_deductions": float(row["total_deductions"]),
-                    "net_income": float(row["net_income"]),
+                    "gross_income": gross_income,
+                    "total_deductions": total_deductions,
+                    "net_income": net_income,
                     "created_at": row["created_at"].strftime("%Y-%m-%d")
                 })
             except Exception as e:
@@ -1576,49 +1753,8 @@ async def get_user_records(username: str = Query(...)):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
     finally:
         if connection.is_connected():
             cursor.close()
             connection.close()
-
-@app.post("/api/insights/generate")
-async def generate_insights(request: InsightRequest):
-    try:
-        headers = {
-            "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
-            "Content-Type": "application/json"
-        }
-
-        payload = {
-            "model": "deepseek/deepseek-chat-v3-0324:free",  # Or "deepseek-coder" or other valid model
-            "messages": [
-                {
-                    "role": "system",
-                    "content": "You are an insightful payroll analysis assistant. Provide helpful observations."
-                },
-                {
-                    "role": "user",
-                    "content": f"Here is the payroll data:\n{request.payslip_data}\nPlease give insights."
-                }
-            ]
-        }
-
-        async with httpx.AsyncClient() as client:
-            response = await client.post("https://openrouter.ai/api/v1/chat/completions", json=payload, headers=headers)
-            response.raise_for_status()
-            result = response.json()
-
-            message = result["choices"][0]["message"]["content"]
-            return {
-                "insights": message,
-                "model": payload["model"],
-                "tokens_used": result.get("usage", {}).get("total_tokens", 0)
-            }
-
-    except httpx.HTTPStatusError as err:
-        print("❌ HTTP error from OpenRouter:", err.response.text)
-        raise HTTPException(status_code=500, detail="Failed to fetch response from OpenRouter")
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
