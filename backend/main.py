@@ -1446,10 +1446,10 @@ async def get_latest_payslip(username: str):
         user = cursor.fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        
+
         user_id = user["id"]
 
-        # Get latest payslip based on year/month instead of created_at
+        # Get latest payslip
         cursor.execute("""
             SELECT *
             FROM payslips
@@ -1464,29 +1464,31 @@ async def get_latest_payslip(username: str):
 
         payslip_id = payslip["id"]
 
-        # Fetch adjustments if available
+        # Fetch adjustments
         cursor.execute("""
             SELECT total_deductions, net_income, late_deduction
             FROM payslip_adjustments
             WHERE payslip_id = %s
         """, (payslip_id,))
-        adjustment = cursor.fetchone()
+        adjustment = cursor.fetchone()  # ✅ ensure this is fetched before the next query
 
         net_income = float(adjustment["net_income"]) if adjustment else float(payslip["net_income"])
         late_deduction = float(adjustment["late_deduction"]) if adjustment and adjustment["late_deduction"] else 0.0
 
         # Bonuses
         cursor.execute("SELECT bonus_name, amount FROM payslip_bonuses WHERE payslip_id = %s", (payslip_id,))
+        bonus_rows = cursor.fetchall()  # ✅ ensure full fetch before moving on
         bonuses = [
             {"label": row["bonus_name"], "amount": float(row["amount"])}
-            for row in cursor.fetchall()
+            for row in bonus_rows
         ]
 
         # Loans and late deduction
         cursor.execute("SELECT loan_name, amount FROM payslip_loan_deductions WHERE payslip_id = %s", (payslip_id,))
+        loan_rows = cursor.fetchall()  # ✅ ensure full fetch before moving on
         loans = [
             {"label": row["loan_name"], "amount": float(row["amount"])}
-            for row in cursor.fetchall()
+            for row in loan_rows
         ]
 
         if late_deduction > 0:
@@ -1505,8 +1507,14 @@ async def get_latest_payslip(username: str):
         }
 
     finally:
-        if 'cursor' in locals(): cursor.close()
-        if 'connection' in locals(): connection.close()
+        # ✅ Defensive check and close
+        try:
+            if 'cursor' in locals():
+                cursor.close()
+            if 'connection' in locals():
+                connection.close()
+        except:
+            pass  # optional: log if closing fails
 
 @app.post("/api/payslip/summary")
 async def get_payslip_summary(data: MonthSelection):
