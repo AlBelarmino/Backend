@@ -98,6 +98,8 @@ class DTRDayEntry(BaseModel):
 class SalaryRequest(BaseModel):
     username: str
     month_str: str  
+    period_start: int
+    period_end: int
 
 
 class DeductionItem(BaseModel):
@@ -112,13 +114,15 @@ class PayslipResponse(BaseModel):
     grossIncome: float
     deductions: List[DeductionItem]
 
-class MonthEntry(BaseModel):
+class PeriodEntry(BaseModel):
     month: str
     year: int
+    period_start: int
+    period_end: int
 
 class MonthSelection(BaseModel):
     username: str
-    selected_months: List[MonthEntry]
+    selected_periods: List[Dict[str, Any]] 
 
 class RecordOut(BaseModel):
     month: str
@@ -581,8 +585,27 @@ async def ocr(
     username: str = Form(...),
     replace_existing: bool = Form(False),
 ):
+    def clean_ocr_text(text: str) -> str:
+        text = re.sub(r'\b([A-Z]),\b', r'\1.', text)  # Fix middle initial C, → C.
+        text = text.replace('|', 'I')
+        return text
+
+    def normalize(s):
+        return s.strip().replace("\n", " ") if s else "Not found"
+
+    def is_valid_name(candidate):
+        return (
+            candidate
+            and not re.search(r'(DAILY TIME RECORD|FORM|CSC|OFFICIAL HOURS|REGULA|MONTH)', candidate.upper())
+            and not re.match(r'^[A-Za-z]+\s+\d{1,2}[-–]\d{1,2},\s*\d{4}$', candidate)
+            and len(candidate.split()) >= 2
+            and not any(char.isdigit() for char in candidate)
+        )
+
+    def normalize_name(n):
+        return re.sub(r'[^A-Z]', '', n.upper())  # Removes spaces, punctuation for comparison
+
     try:
-        print(f"Processing DTR for user: {username}")
         connection = mysql.connector.connect(**db_config)
         cursor = connection.cursor(dictionary=True)
 
@@ -591,34 +614,21 @@ async def ocr(
         user = cursor.fetchone()
         if not user:
             raise HTTPException(status_code=401, detail="Invalid user")
-        
+
         user_id = user["id"]
         full_name = user["full_name"].strip().upper()
 
-        # Process file
+        # Read file
         contents = await file.read()
         images = convert_from_bytes(contents, poppler_path=POPPLER_PATH) if file.filename.lower().endswith(".pdf") \
             else [Image.open(io.BytesIO(contents))]
 
-        full_text = "\n\n".join([pytesseract.image_to_string(img) for img in images])
+        raw_text = "\n\n".join([pytesseract.image_to_string(img) for img in images])
+        full_text = clean_ocr_text(raw_text)
         dtr_sections = re.split(r'\n(?=DAILY TIME RECORD)', full_text, flags=re.IGNORECASE)
 
-        def normalize(s):
-            return s.strip().replace("\n", " ") if s else "Not found"
-
-        def is_valid_name(candidate):
-            return (
-                candidate
-                and not re.search(r'(DAILY TIME RECORD|FORM|CSC|OFFICIAL HOURS|REGULA|MONTH)', candidate.upper())
-                and not re.match(r'^[A-Za-z]+\s+\d{1,2}[-–]\d{1,2},\s*\d{4}$', candidate)
-                and len(candidate.split()) >= 2
-                and not any(char.isdigit() for char in candidate)
-            )
-
-        extracted_data = []
-        # Updated pattern to better handle day numbers (including '11' being misread as 'u')
         daily_pattern = re.compile(
-            r'^([uU]|\d{1,2})\s+'  # Handles 'u' or 'U' which might be misread '11'
+            r'^([uU]|\d{1,2})\s+'
             r'(\d{1,2}:\d{2}\s*[APapmM]*)\s+'
             r'(\d{1,2}:\d{2}\s*[APapmM]*)\s+'
             r'(\d{1,2}:\d{2}\s*[APapmM]*)\s+'
@@ -626,6 +636,8 @@ async def ocr(
             r'(?:(\d+)\s*hrs?\s*(\d+)\s*mins?)?',
             re.MULTILINE | re.IGNORECASE
         )
+
+        extracted_data = []
 
         for dtr_text in dtr_sections:
             lines = [line.strip() for line in dtr_text.splitlines() if line.strip()]
@@ -636,44 +648,48 @@ async def ocr(
                 if "NAME" in line.upper():
                     parts = re.split(r'NAME', line, flags=re.IGNORECASE)
                     if len(parts) > 1 and is_valid_name(parts[0].strip()):
-                        name = parts[0].strip()
+                        name = clean_ocr_text(parts[0].strip())
                         break
                     elif i > 0 and is_valid_name(lines[i - 1]):
-                        name = lines[i - 1]
+                        name = clean_ocr_text(lines[i - 1])
                         break
                     elif i + 1 < len(lines) and is_valid_name(lines[i + 1]):
-                        name = lines[i + 1]
+                        name = clean_ocr_text(lines[i + 1])
                         break
 
-            if full_name not in name.upper():
+            if normalize_name(full_name) not in normalize_name(name):
                 raise HTTPException(status_code=403, detail=f"DTR belongs to {name}, not the logged-in user.")
 
-            # Extract month
-            month_year_match = re.search(r'([A-Za-z]+),\s*(\d{4})', dtr_text)
-            if not month_year_match:
-                raise HTTPException(status_code=400, detail="Could not extract month and year from DTR")
+            # ✅ Extract month, period_start, period_end, year
+            period_match = re.search(
+                r'([A-Za-z]+)\s+(\d{1,2})\s*[-–]\s*(\d{1,2}),\s*(\d{4})',
+                dtr_text
+            )
+            if not period_match:
+                raise HTTPException(status_code=400, detail="Could not extract payroll period")
 
-            parsed_month = month_year_match.group(1).strip().capitalize()
-            parsed_year = int(month_year_match.group(2).strip())
+            parsed_month = period_match.group(1).capitalize()
+            period_start = int(period_match.group(2))
+            period_end = int(period_match.group(3))
+            parsed_year = int(period_match.group(4))
 
-            # Check existing DTR and delete if replacing
+            # Check existing DTR
             cursor.execute("""
-                SELECT id FROM dtrs WHERE user_id = %s AND LOWER(month) = LOWER(%s) AND year = %s
-            """, (user_id, parsed_month.lower(), parsed_year))
+                SELECT id FROM dtrs
+                WHERE user_id = %s AND LOWER(month) = LOWER(%s)
+                AND year = %s AND period_start = %s AND period_end = %s
+            """, (user_id, parsed_month.lower(), parsed_year, period_start, period_end))
             existing_dtr = cursor.fetchone()
 
             if existing_dtr and not replace_existing:
                 raise HTTPException(
                     status_code=409,
-                    detail=f"You already uploaded a DTR for {parsed_month}. Set 'replace_existing' to true to replace it."
+                    detail=f"You already uploaded a DTR for {parsed_month} {period_start}-{period_end}. Set 'replace_existing' to true to replace it."
                 )
             elif existing_dtr and replace_existing:
-                # Delete existing daily records first
                 cursor.execute("DELETE FROM dtr_days WHERE dtr_id = %s", (existing_dtr["id"],))
-                # Then delete the DTR header
                 cursor.execute("DELETE FROM dtrs WHERE id = %s", (existing_dtr["id"],))
                 connection.commit()
-                print(f"Deleted existing DTR {existing_dtr['id']} and its daily records for replacement")
 
             # Extract working hours
             working_hours = "Not found"
@@ -693,8 +709,7 @@ async def ocr(
                 afternoon_end = f"{working_match.group(7)} {working_match.group(8) or ''}".strip()
                 working_hours = f"{morning_start} - {morning_end} and {afternoon_start} - {afternoon_end}"
 
-            # Extract other fields
-            verified_match = re.search(r'\b(JUAN Z\. DELA CRUZ)\b', dtr_text, re.IGNORECASE)
+            verified_match = re.search(r'\b(JUAN Z\. DELA CRUZ|RACHELLE ARAQUE)\b', dtr_text, re.IGNORECASE)
             position_match = re.search(r'\b(Principal|Manager|Supervisor)\b', dtr_text, re.IGNORECASE)
             total_time_match = re.search(r'\bTOTAL\s+(\d+\s+hours\s+and\s+\d+\s+minutes)\b', dtr_text, re.IGNORECASE)
 
@@ -702,6 +717,8 @@ async def ocr(
                 "name": normalize(name),
                 "month": parsed_month,
                 "year": parsed_year,
+                "period_start": period_start,
+                "period_end": period_end,
                 "workingHours": normalize(working_hours),
                 "verifiedBy": normalize(verified_match.group(1)) if verified_match else "Not found",
                 "position": normalize(position_match.group(1)) if position_match else "Not found",
@@ -709,40 +726,29 @@ async def ocr(
                 "dailyRecords": []
             }
 
-            # Insert DTR header
+            # Insert into dtrs table
             cursor.execute("""
-                INSERT INTO dtrs (user_id, employee_name, month, year, working_hours, verified_by, position, total_time)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO dtrs (user_id, employee_name, month, year, period_start, period_end,
+                                  working_hours, verified_by, position, total_time)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
-                user_id, parsed["name"], parsed["month"], parsed["year"], parsed["workingHours"],
+                user_id, parsed["name"], parsed["month"], parsed["year"],
+                parsed["period_start"], parsed["period_end"], parsed["workingHours"],
                 parsed["verifiedBy"], parsed["position"], parsed["totalTime"]
             ))
-            
-            # Get inserted DTR ID
+
             cursor.execute("SELECT LAST_INSERT_ID() AS dtr_id")
             dtr_id = cursor.fetchone()["dtr_id"]
-            print(f"Inserted DTR ID: {dtr_id}")
 
-            # Process daily entries with improved validation
-            daily_entries = []
+            # Daily entries
             insert_values = []
             for match in daily_pattern.finditer(dtr_text):
                 try:
-                    day_str = match.group(1).upper()  # Convert to uppercase for 'U' check
-                    
-                    # Handle 'u' being misread as '11'
-                    if day_str == 'U':
-                        day = 11
-                    else:
-                        if not day_str.isdigit():
-                            print(f"Skipping invalid day: {day_str}")
-                            continue
-                        day = int(day_str)
-                    
+                    day_str = match.group(1).upper()
+                    day = 11 if day_str == 'U' else int(day_str)
                     if day < 1 or day > 31:
                         continue
 
-                    # Normalize time format
                     def format_time(t):
                         t = re.sub(r'\s+', '', t).upper()
                         if not re.search(r'[AP]M$', t):
@@ -761,7 +767,13 @@ async def ocr(
                     undertime_hours = int(match.group(6)) if match.group(6) else 0
                     undertime_minutes = int(match.group(7)) if match.group(7) else 0
 
-                    daily_entries.append({
+
+                    insert_values.append((
+                        dtr_id, day, am_arrival, am_departure,
+                        pm_arrival, pm_departure, undertime_hours, undertime_minutes
+                    ))
+
+                    parsed["dailyRecords"].append({
                         "day": day,
                         "am_arrival": am_arrival,
                         "am_departure": am_departure,
@@ -771,33 +783,20 @@ async def ocr(
                         "undertime_minutes": undertime_minutes
                     })
 
-                    insert_values.append((
-                        dtr_id,
-                        day,
-                        am_arrival,
-                        am_departure,
-                        pm_arrival,
-                        pm_departure,
-                        undertime_hours,
-                        undertime_minutes
-                    ))
-
                 except Exception as e:
-                    print(f"Error processing day entry: {str(e)}")
+                    print(f"Error processing day entry: {e}")
                     continue
 
-            # Batch insert daily entries
             if insert_values:
                 cursor.executemany("""
                     INSERT INTO dtr_days 
                     (dtr_id, day, am_arrival, am_departure, pm_arrival, pm_departure, undertime_hours, undertime_minutes)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 """, insert_values)
-                print(f"Inserted {len(insert_values)} daily records for DTR {dtr_id}")
 
-            connection.commit()
-            parsed["dailyRecords"] = daily_entries
             extracted_data.append(parsed)
+
+        connection.commit()
 
         return JSONResponse({
             "text": full_text,
@@ -875,9 +874,11 @@ async def compute_salary(payload: SalaryRequest):
         cursor.execute("""
             SELECT * FROM dtrs 
             WHERE user_id = %s 
-            AND month = %s
+            AND month = %s 
+            AND period_start = %s 
+            AND period_end = %s
             LIMIT 1
-        """, (user_id, month_str))
+        """, (user_id, month_str, payload.period_start, payload.period_end))
         dtr = cursor.fetchone()
         if not dtr:
             raise HTTPException(status_code=404, detail=f"No DTR found for {month_str}")
@@ -890,7 +891,7 @@ async def compute_salary(payload: SalaryRequest):
             month_index = list(calendar.month_name).index(dtr_month)
             _, num_days = calendar.monthrange(dtr_year, month_index)
             working_days = sum(
-                1 for day in range(1, num_days + 1)
+                1 for day in range(dtr["period_start"], dtr["period_end"] + 1)
                 if datetime(dtr_year, month_index, day).weekday() < 5
             )
         except:
@@ -972,9 +973,11 @@ async def compute_salary(payload: SalaryRequest):
             monthly_salary = float(profile["base_monthly_salary"])
             employment_type = profile["employment_type"]
             leave_credits = float(profile["leave_credits"] or 0)
-            philhealth = float(profile["philhealth_deduction"] or 0)
-            tax = float(profile["tax_deduction"] or 0)
-            gsis = float(profile["gsis_deduction"] or 0)
+            employment_type = profile["employment_type"]
+            raw_tax = float(profile["tax_deduction"] or 0)
+            philhealth = float(profile["philhealth_deduction"] or 0) / 2 if employment_type == "regular" else 0
+            gsis = float(profile["gsis_deduction"] or 0) / 2 if employment_type == "regular" else 0
+            tax = raw_tax / 2 if employment_type == "regular" else raw_tax
         except (TypeError, ValueError) as e:
             raise HTTPException(status_code=500, detail=f"Invalid payroll values: {str(e)}")
 
@@ -992,13 +995,17 @@ async def compute_salary(payload: SalaryRequest):
             gross = total_hours * rate
             days_absent = 0
             leave_used = 0
+            loan_deduction = 0.0        # ✅ Initialize for irregulars (no loans)
+            loans_to_save = []          
         else:
-            gross = monthly_salary
+            semi_monthly_salary = monthly_salary / 2                   # 💡
+            gross = semi_monthly_salary
             days_absent = max(working_days - days_present, 0)
             leave_used = min(leave_credits, days_absent)
             unpaid_absent_days = max(days_absent - leave_used, 0)
-            absent_deduction = round((monthly_salary / working_days) * unpaid_absent_days, 2)
-            gross = monthly_salary - absent_deduction - late_deduction  # Deduct late penalty
+            absent_deduction = round((semi_monthly_salary / working_days) * unpaid_absent_days, 2)
+            late_deduction = round((total_late_minutes / 60) * rate, 2)
+            gross = semi_monthly_salary - absent_deduction - late_deduction
             new_leave_credits = leave_credits - leave_used
             
             # Update leave credits in profile
@@ -1008,56 +1015,59 @@ async def compute_salary(payload: SalaryRequest):
             )
             print(f"📝 Updated leave credits: {new_leave_credits}")
 
-        # 7. Process Loans
-        loan_deduction = 0.0
-        loans_to_save = []
-        try:
-            cursor.execute("""
-                SELECT id, loan_name, amount, duration_months, 
-                    start_month, start_year, balance
-                FROM employee_loans 
-                WHERE user_id = %s AND balance > 0
-            """, (user_id,))
-            loans = cursor.fetchall()
-            
-            current_period = f"{dtr_month} {dtr_year}"
-            
-            for loan in loans:
-                try:
-                    # Handle month format
-                    if loan['start_month'].isdigit():
-                        month_num = int(loan['start_month'])
-                        start_month = calendar.month_name[month_num]
-                    else:
-                        start_month = loan['start_month'].capitalize()
-                    
-                    loan_date = datetime.strptime(f"{start_month} {loan['start_year']}", "%B %Y")
-                    current_date = datetime.strptime(current_period, "%B %Y")
-                    
-                    if current_date >= loan_date:
-                        monthly_payment = round(float(loan['amount']) / loan['duration_months'], 2)
-                        if monthly_payment > float(loan['balance']):
-                            monthly_payment = float(loan['balance'])
+            # 7. Process Loans
+            loan_deduction = 0.0
+            loans_to_save = []
+            try:
+                cursor.execute("""
+                    SELECT id, loan_name, amount, duration_months, 
+                        start_month, start_year, balance
+                    FROM employee_loans 
+                    WHERE user_id = %s AND balance > 0
+                """, (user_id,))
+                loans = cursor.fetchall()
+                
+                current_period = f"{dtr_month} {dtr_year}"
+                
+                for loan in loans:
+                    try:
+                        # Handle month format
+                        if loan['start_month'].isdigit():
+                            month_num = int(loan['start_month'])
+                            start_month = calendar.month_name[month_num]
+                        else:
+                            start_month = loan['start_month'].capitalize()
                         
-                        loan_deduction += monthly_payment
-                        new_balance = round(float(loan['balance']) - monthly_payment, 2)
+                        loan_date = datetime.strptime(f"{start_month} {loan['start_year']}", "%B %Y")
+                        current_date = datetime.strptime(current_period, "%B %Y")
                         
-                        loans_to_save.append({
-                            'loan_name': loan['loan_name'],
-                            'amount': monthly_payment
-                        })
-                        
-                        cursor.execute(
-                            "UPDATE employee_loans SET balance = %s WHERE id = %s",
-                            (new_balance, loan['id'])
-                        )
-                        print(f"📝 Updated loan balance: {loan['loan_name']} = {new_balance}")
-                except Exception as e:
-                    print(f"Error processing loan {loan.get('id')}: {str(e)}")
-                    continue
-        except Exception as e:
-            print(f"Loan processing failed: {str(e)}")
+                        if current_date >= loan_date:
+                            monthly_payment = round(float(loan['amount']) / loan['duration_months'], 2)
+                            half_payment = round(monthly_payment / 2, 2)
 
+                            # Prevent overpaying the remaining balance
+                            if half_payment > float(loan['balance']):
+                                half_payment = float(loan['balance'])
+
+                            loan_deduction += half_payment
+                            new_balance = round(float(loan['balance']) - half_payment, 2)
+
+                            loans_to_save.append({
+                                'loan_name': loan['loan_name'],
+                                'amount': half_payment
+                            })
+
+                            cursor.execute(
+                                "UPDATE employee_loans SET balance = %s WHERE id = %s",
+                                (new_balance, loan['id'])
+                            )
+                            print(f"✅ Loan updated: {loan['loan_name']} new balance = {new_balance}")
+                    except Exception as e:
+                        print(f"Error processing loan {loan.get('id')}: {str(e)}")
+                        continue
+            except Exception as e:
+                print(f"Loan processing failed: {str(e)}")
+                
         # 8. Process Bonuses
         bonuses = 0.0
         bonuses_to_save = []
@@ -1073,10 +1083,10 @@ async def compute_salary(payload: SalaryRequest):
                 try:
                     # Monthly bonuses always apply
                     if b["frequency"] == "monthly":
-                        bonuses += float(b["amount"])
+                        bonuses += float(b["amount"]) 
                         bonuses_to_save.append({
                             'bonus_name': b["bonus_name"],
-                            'amount': float(b["amount"])
+                            'amount': float(b["amount"]) / 2
                         })
                     # Yearly bonuses only in December
                     elif b["frequency"] == "yearly" and dtr_month.lower() == "december":
@@ -1095,24 +1105,41 @@ async def compute_salary(payload: SalaryRequest):
         total_deductions = round(gsis + philhealth + tax + loan_deduction + late_deduction, 2)
         net = round(gross + bonuses - total_deductions, 2)
 
-        # 10. Save payslip with late information
+        # 10. Save payslip with all computed values
         cursor.execute("""
             INSERT INTO payslips (
-                user_id, dtr_id, month, year,
+                user_id, dtr_id, month, year, period_start, period_end,
                 working_days, days_present, days_absent, leave_used,
-                total_hours, late_minutes, late_deduction, gross_income, bonuses,
+                total_hours, late_minutes, late_deduction, 
+                gross_income, bonuses,
                 philhealth_deduction, tax_deduction, loan_deduction,
                 total_deductions, net_income, created_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            ON DUPLICATE KEY UPDATE
+                working_days = VALUES(working_days),
+                days_present = VALUES(days_present),
+                days_absent = VALUES(days_absent),
+                leave_used = VALUES(leave_used),
+                total_hours = VALUES(total_hours),
+                late_minutes = VALUES(late_minutes),
+                late_deduction = VALUES(late_deduction),
+                gross_income = VALUES(gross_income),
+                bonuses = VALUES(bonuses),
+                philhealth_deduction = VALUES(philhealth_deduction),
+                tax_deduction = VALUES(tax_deduction),
+                loan_deduction = VALUES(loan_deduction),
+                total_deductions = VALUES(total_deductions),
+                net_income = VALUES(net_income)
         """, (
-            user_id, dtr["id"], dtr_month, dtr_year,
+            user_id, dtr["id"], dtr_month, dtr_year, dtr["period_start"], dtr["period_end"],
             working_days, days_present, days_absent, leave_used,
-            round(total_hours, 2), total_late_minutes, late_deduction, round(gross, 2), round(bonuses, 2),
+            round(total_hours, 2), total_late_minutes, late_deduction, 
+            round(gross, 2), round(bonuses, 2),
             philhealth, tax, round(loan_deduction, 2),
             total_deductions, net
         ))
         
-        payslip_id = cursor.lastrowid
+        payslip_id = cursor.lastrowid or dtr["id"]  # Use lastrowid or fallback to dtr_id
         print(f"💾 Saved payslip ID: {payslip_id}")
 
         # 11. Save loan deductions
@@ -1121,6 +1148,8 @@ async def compute_salary(payload: SalaryRequest):
                 INSERT INTO payslip_loan_deductions 
                 (payslip_id, loan_name, amount)
                 VALUES (%s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    amount = VALUES(amount)
             """, (payslip_id, loan['loan_name'], loan['amount']))
 
         # 12. Save bonuses
@@ -1129,6 +1158,8 @@ async def compute_salary(payload: SalaryRequest):
                 INSERT INTO payslip_bonuses 
                 (payslip_id, bonus_name, amount)
                 VALUES (%s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    amount = VALUES(amount)
             """, (payslip_id, bonus['bonus_name'], bonus['amount']))
 
         # 13. Update DTR status
@@ -1143,10 +1174,16 @@ async def compute_salary(payload: SalaryRequest):
             "status": "success",
             "data": {
                 "employee": dtr["employee_name"],
-                "period": f"{dtr_month} {dtr_year}",
+                "period": f"{dtr_month} {dtr['period_start']}-{dtr['period_end']}, {dtr_year}",
+                "working_days": working_days,
+                "days_present": days_present,
+                "days_absent": days_absent,
+                "leave_used": leave_used,
+                "total_hours": round(total_hours, 2),
+                "late_minutes": total_late_minutes,
+                "late_deduction": late_deduction,
                 "grossIncome": round(gross, 2),
-                "lateMinutes": total_late_minutes, 
-                "lateDeduction": late_deduction,
+                "bonuses": round(bonuses, 2),
                 "deductions": {
                     "philhealth": philhealth,
                     "tax": tax,
@@ -1211,8 +1248,8 @@ def parse_db_month_to_iso(month: str, year: int) -> str:
 
 
 @app.get("/payslip")
-async def get_payslip(username: str, month: str, year: int):
-    print(f"🔍 Fetching payslip for {username}, input month: {month}, input year: {year}")
+async def get_payslip(username: str, month: str, year: int, period_start: int, period_end: int):
+    print(f"🔍 Fetching payslip for {username}, input month: {month}, input year: {year}, input period start{period_start}, input period end{period_end}")
 
     try:
         connection = mysql.connector.connect(**db_config)
@@ -1239,10 +1276,13 @@ async def get_payslip(username: str, month: str, year: int):
         cursor.execute("""
             SELECT *
             FROM payslips
-            WHERE user_id = %s AND LOWER(TRIM(month)) = %s AND year = %s
-            ORDER BY created_at DESC
+            WHERE user_id = %s
+            AND LOWER(TRIM(month)) = %s
+            AND year = %s
+            AND period_start = %s
+            AND period_end = %s
             LIMIT 1
-        """, (user_id, normalized_month.lower(), normalized_year))
+        """, (user_id, normalized_month.lower(), normalized_year, period_start, period_end))
 
         payslip = cursor.fetchone()
         if not payslip:
@@ -1368,7 +1408,7 @@ async def get_payslip(username: str, month: str, year: int):
 
         response = {
             "fullName": full_name,
-            "period": parse_db_month_to_iso(normalized_month, normalized_year),
+            "period": f"{normalized_month} {period_start}-{period_end}, {normalized_year}",
             "employmentType": employment_type,
             "salaryGrade": profile.get("salary_grade") if profile else None,
             "ratePerHour": rate_per_hour,
@@ -1416,31 +1456,26 @@ async def get_available_months(username: str):
             raise HTTPException(status_code=404, detail="User not found")
 
         cursor.execute("""
-            SELECT * FROM (
-                SELECT DISTINCT TRIM(month) as month, year
-                FROM payslips 
-                WHERE user_id = %s
-            ) AS months
+            SELECT DISTINCT 
+                TRIM(month) as month, 
+                year,
+                period_start,
+                period_end
+            FROM payslips 
+            WHERE user_id = %s
             ORDER BY year DESC, STR_TO_DATE(CONCAT('01 ', month), '%%d %%M') DESC
         """, (user['id'],))
         
         results = cursor.fetchall()
-        return [{"month": row["month"], "year": row["year"]} for row in results]
+        return results
 
     except Exception as e:
-        traceback.print_exc()  # <-- This will show the exact error in the console
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         if 'connection' in locals() and connection.is_connected():
             cursor.close()
             connection.close()
-
-def cleanup_cursor(cursor):
-    try:
-        while cursor.nextset():
-            pass
-    except:
-        pass
 
 @app.get("/payslip/latest")
 async def get_latest_payslip(username: str):
@@ -1451,55 +1486,54 @@ async def get_latest_payslip(username: str):
         # 1. Get the user
         cursor.execute("SELECT id, full_name FROM users WHERE username = %s", (username,))
         user = cursor.fetchone()
-        cleanup_cursor(cursor)
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
         user_id = user["id"]
 
-        # 2. Get latest payslip
+        # 2. Get latest payslip with period info
         cursor.execute("""
-            SELECT * FROM payslips
+            SELECT id, month, year, period_start, period_end, gross_income, net_income
+            FROM payslips
             WHERE user_id = %s
-            ORDER BY year DESC,
-                     STR_TO_DATE(CONCAT('01 ', month), '%%d %%M') DESC
+            ORDER BY
+                year DESC,
+                STR_TO_DATE(CONCAT('01 ', month), '%%d %%M') DESC,
+                CAST(period_end AS UNSIGNED) DESC,
+                created_at DESC
             LIMIT 1
         """, (user_id,))
+        
         payslip = cursor.fetchone()
-        cleanup_cursor(cursor)
         if not payslip:
             raise HTTPException(status_code=404, detail="No payslip found")
+
         payslip_id = payslip["id"]
 
-        # 3. Fetch precomputed adjustments (net income and late)
+        # 3. Adjustments
         cursor.execute("""
             SELECT net_income, late_deduction
             FROM payslip_adjustments
             WHERE payslip_id = %s
         """, (payslip_id,))
         adjustment = cursor.fetchone()
-        cleanup_cursor(cursor)
         net_income = float(adjustment["net_income"]) if adjustment and adjustment["net_income"] else float(payslip["net_income"])
         late_deduction = float(adjustment["late_deduction"]) if adjustment and adjustment["late_deduction"] else 0.0
 
         # 4. Bonuses
         cursor.execute("SELECT bonus_name, amount FROM payslip_bonuses WHERE payslip_id = %s", (payslip_id,))
-        bonus_rows = cursor.fetchall()
-        cleanup_cursor(cursor)
-        bonuses = [{"label": row["bonus_name"], "amount": float(row["amount"])} for row in bonus_rows]
+        bonuses = [{"label": row["bonus_name"], "amount": float(row["amount"])} for row in cursor.fetchall()]
 
         # 5. Loans
         cursor.execute("SELECT loan_name, amount FROM payslip_loan_deductions WHERE payslip_id = %s", (payslip_id,))
-        loan_rows = cursor.fetchall()
-        cleanup_cursor(cursor)
-        loans = [{"label": row["loan_name"], "amount": float(row["amount"])} for row in loan_rows]
+        loans = [{"label": row["loan_name"], "amount": float(row["amount"])} for row in cursor.fetchall()]
 
-        # Append late deduction if any
         if late_deduction > 0:
             loans.append({"label": "Late Deduction", "amount": late_deduction})
 
+        # 6. Return result with full period range
         return {
             "fullName": user["full_name"],
-            "period": f"{payslip['month']} {payslip['year']}",
+            "period": f"{payslip['month']} {payslip['period_start']}-{payslip['period_end']}, {payslip['year']}",
             "grossIncome": float(payslip["gross_income"]),
             "netPay": net_income,
             "bonuses": bonuses,
@@ -1513,6 +1547,7 @@ async def get_latest_payslip(username: str):
         if 'connection' in locals():
             try: connection.close()
             except: pass
+
 
 @app.post("/api/payslip/summary")
 async def get_payslip_summary(data: MonthSelection):
@@ -1549,23 +1584,28 @@ async def get_payslip_summary(data: MonthSelection):
             4: "Oct-Dec"
         }
 
-        for entry in data.selected_months:
-            month = entry.month
-            year = entry.year
+        for entry in data.selected_periods:  # Changed from selected_months to selected_periods
+            month = entry["month"]
+            year = entry["year"]
+            period_start = entry["period_start"]
+            period_end = entry["period_end"]
 
             cursor.execute("""
                 SELECT *
                 FROM payslips
-                WHERE user_id = %s AND month = %s AND year = %s
-                ORDER BY created_at DESC
+                WHERE user_id = %s
+                AND month = %s
+                AND year = %s
+                AND period_start = %s
+                AND period_end = %s
                 LIMIT 1
-            """, (user_id, month, year))
+            """, (user_id, month, year, period_start, period_end))
             payslip = cursor.fetchone()
             if not payslip:
                 continue
 
             payslip_id = payslip["id"]
-            month_key = f"{month} {year}"
+            month_key = f"{month} {period_start}-{period_end}, {year}"
             month_list.append(month_key)
 
             # Get quarter key for potential future use
@@ -1666,7 +1706,8 @@ async def get_payslip_summary(data: MonthSelection):
             "fullName": full_name,
             "employmentType": user.get("employment_type", "regular"),
             "salaryGrade": user.get("salary_grade", ""),
-            "monthlySummary": monthly_summary,
+            "periodSummary": monthly_summary,  # ✅ rename from monthlySummary
+            "periods": month_list,  
             "quarterSummary": quarter_summary,  # still useful for charts
             "incomeBreakdown": dict(income_breakdown),
             "deductionBreakdown": dict(deduction_breakdown),
@@ -1698,61 +1739,117 @@ async def get_user_records(username: str = Query(...)):
         user = cursor.fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
+
         user_id = user["id"]
 
-        # Get payslips + latest adjustments
+        # Get payslip records
         cursor.execute("""
             SELECT 
-                p.id AS payslip_id,
-                p.month, 
-                p.year,
-                p.gross_income,
-                p.created_at,
-                p.total_deductions AS original_deductions,
-                p.net_income AS original_net,
-                adj.total_deductions AS adj_deductions,
-                adj.net_income AS adj_net
-            FROM payslips p
-            LEFT JOIN (
-                SELECT pa.*
-                FROM payslip_adjustments pa
-                INNER JOIN (
-                    SELECT payslip_id, MAX(updated_at) AS latest
-                    FROM payslip_adjustments
-                    GROUP BY payslip_id
-                ) latest_adj 
-                ON pa.payslip_id = latest_adj.payslip_id 
-                AND pa.updated_at = latest_adj.latest
-            ) adj ON adj.payslip_id = p.id
-            WHERE p.user_id = %s
-            ORDER BY p.year DESC, 
-                     STR_TO_DATE(CONCAT('01 ', p.month), '%%d %%M') DESC
+            p.id AS payslip_id,
+            p.month, 
+            p.year,
+            p.period_start,
+            p.period_end,
+            p.gross_income,
+            p.total_deductions AS original_deductions,
+            p.net_income AS original_net,
+            p.created_at
+        FROM payslips p
+        WHERE p.user_id = %s
+        ORDER BY p.year DESC, 
+        STR_TO_DATE(CONCAT('01 ', p.month), '%%d %%M') DESC
         """, (user_id,))
         
         payslips = cursor.fetchall()
         formatted = []
 
         for row in payslips:
+            payslip_id = row["payslip_id"]
+
+            # Check for adjustments
+            cursor.execute("SELECT total_deductions, net_income FROM payslip_adjustments WHERE payslip_id = %s", (payslip_id,))
+            adjustment = cursor.fetchone()
+
+            total_deductions = float(adjustment["total_deductions"]) if adjustment else float(row["original_deductions"])
+            net_income = float(adjustment["net_income"]) if adjustment else float(row["original_net"])
+            gross_income = float(row["gross_income"])
+
+            # Format period
             try:
                 date_obj = datetime.strptime(f"{row['month']} {row['year']}", "%B %Y")
                 formatted.append({
                     "period": date_obj.strftime("%Y-%m"),
-                    "displayMonth": date_obj.strftime("%B %Y"),
-                    "gross_income": float(row["gross_income"]),
-                    "total_deductions": float(row["adj_deductions"] or row["original_deductions"]),
-                    "net_income": float(row["adj_net"] or row["original_net"]),
+                    "displayMonth": f"{row['month']} {row['period_start']}-{row['period_end']}, {row['year']}",
+                    "gross_income": gross_income,
+                    "total_deductions": total_deductions,
+                    "net_income": net_income,
                     "created_at": row["created_at"].strftime("%Y-%m-%d")
                 })
             except Exception as e:
-                print(f"⚠️ Skipping malformed record: {str(e)}")
+                print(f"⚠️ Skip malformed record: {str(e)}")
                 continue
 
         return formatted
 
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Internal Server Error")
+        raise HTTPException(status_code=500, detail=str(e))
 
     finally:
-        if 'cursor' in locals(): cursor.close()
-        if 'connection' in locals() and connection.is_connected(): connection.close()
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+
+@app.post("/api/insights/generate")
+async def generate_insights(request: InsightRequest):
+    try:
+        headers = {
+            "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
+            "Content-Type": "application/json"
+        }
+
+        payload = {
+            "model": "deepseek/deepseek-chat-v3-0324:free",
+            "messages": [
+                {
+                    "role": "system",
+                    "content":  (
+                                "You are an insightful payroll analysis assistant. "
+                                "Always write your insights directly to the employee as if you're speaking to them. "
+                                "Use second-person point of view (e.g., 'You earned...', 'You had...', 'Your net pay...'). "
+                                "Keep the tone professional, friendly, and easy to understand."
+                            )
+                                            },
+                {
+                    "role": "user",
+                    "content": f"Here is the payroll data:\n{request.payslip_data}\nPlease give insights."
+                }
+            ]
+        }
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                json=payload,
+                headers=headers
+            )
+            response.raise_for_status()
+            result = response.json()
+
+            message = result["choices"][0]["message"]["content"]
+            return {
+                "insights": message,
+                "model": payload["model"],
+                "tokens_used": result.get("usage", {}).get("total_tokens", 0)
+            }
+
+    except httpx.RequestError as err:
+        print("❌ Network/connection error:", err)
+        raise HTTPException(status_code=503, detail="Network error: Unable to contact OpenRouter API.")
+    except httpx.HTTPStatusError as err:
+        print("❌ HTTP error from OpenRouter:", err.response.text)
+        raise HTTPException(status_code=err.response.status_code, detail="Failed to fetch response from OpenRouter.")
+    except Exception as e:
+        print("❌ Unhandled exception:", str(e))
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
