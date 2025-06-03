@@ -1450,22 +1450,24 @@ async def get_available_months(username: str):
         connection = mysql.connector.connect(**db_config)
         cursor = connection.cursor(dictionary=True)
 
+        # Get user ID
         cursor.execute("SELECT id FROM users WHERE username = %s", (username,))
         user = cursor.fetchone()
         if not user:
             raise HTTPException(status_code=404, detail="User not found")
 
+        # Fixed query: use subquery to allow computed ORDER BY
         cursor.execute("""
-            SELECT DISTINCT 
-                TRIM(month) as month, 
-                year,
-                period_start,
-                period_end
-            FROM payslips 
-            WHERE user_id = %s
-            ORDER BY year DESC, STR_TO_DATE(CONCAT('01 ', month), '%%d %%M') DESC
-        """, (user['id'],))
-        
+            SELECT month, year, period_start, period_end
+            FROM (
+                SELECT DISTINCT TRIM(month) AS month, year, period_start, period_end
+                FROM payslips
+                WHERE user_id = %s
+            ) AS sub
+            ORDER BY year DESC, 
+                     STR_TO_DATE(CONCAT('01 ', month), '%%d %%M') DESC
+        """, (user["id"],))
+
         results = cursor.fetchall()
         return results
 
@@ -1476,6 +1478,7 @@ async def get_available_months(username: str):
         if 'connection' in locals() and connection.is_connected():
             cursor.close()
             connection.close()
+
 
 @app.get("/payslip/latest")
 async def get_latest_payslip(username: str):
